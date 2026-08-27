@@ -5,9 +5,9 @@ from PIL import Image, ImageOps, ImageEnhance
 from transformers import pipeline
 
 app = FastAPI(
-    title="Kisan AI - Precision Indian Field Diagnostic Engine",
-    description="Precision classification for Indian village staples (Paddy, Cotton, Tomato, Pepper, Potato).",
-    version="3.1.0"
+    title="Kisan AI - Precision Crop Diagnostic Core",
+    description="Vision AI diagnosis with confidence filtering and out-of-domain detection.",
+    version="3.7.0"
 )
 
 app.add_middleware(
@@ -18,103 +18,72 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print("Loading Crop AI Models...")
-hort_classifier = pipeline("image-classification", model="kimcomehome/plantvillage-vit-leaf-disease")
+print("Loading Agricultural Vision Model...")
+MODEL_ID = "kimcomehome/plantvillage-vit-leaf-disease"
+classifier = pipeline("image-classification", model=MODEL_ID)
+print("Universal Crop Vision Engine Loaded Successfully!")
 
-try:
-    paddy_classifier = pipeline("image-classification", model="davanstrien/autotrain-rice-disease-classification")
-    print("Rice/Paddy Vision Model loaded successfully!")
-except Exception:
-    paddy_classifier = None
-    print("Fallback to multi-crop ensemble.")
-
-print("Vision Pipelines Ready!")
-
-RICE_LABELS_MAP = {
-    "bacterial_leaf_blight": "Bacterial Leaf Blight (బాక్టీరియల్ ఆకు ఎండు తెగులు)",
-    "brown_spot": "Brown Spot (గోధుమ రంగు మచ్చ తెగులు)",
-    "leaf_blast": "Leaf Blast (అగ్గి తెగులు)",
-    "sheath_blight": "Sheath Blight (కాండం కుళ్ళు తెగులు)",
-    "tungro": "Tungro Virus (తుంగ్రో వైరస్)",
-    "healthy": "Healthy Leaf (ఆరోగ్యకరమైన ఆకు)"
-}
+CONFIDENCE_THRESHOLD_MIN = 35.0
+CONFIDENCE_THRESHOLD_HIGH = 60.0
 
 def preprocess_leaf(image: Image.Image) -> Image.Image:
     image = ImageOps.exif_transpose(image)
     enhancer = ImageEnhance.Contrast(image)
     return enhancer.enhance(1.15)
 
+@app.get("/")
+def root():
+    return {"status": "online", "model": "ViT Crop Disease Diagnostic Engine"}
+
 @app.post("/api/v1/predict/leaf")
 async def detect_crop_disease(file: UploadFile = File(...)):
     if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Uploaded file must be a valid image.")
+        raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
     try:
         image_bytes = await file.read()
         raw_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         processed_image = preprocess_leaf(raw_image)
 
-        hort_preds = hort_classifier(processed_image, top_k=3)
-        top_hort = hort_preds[0]
-        hort_score = round(top_hort["score"] * 100, 2)
+        predictions = classifier(processed_image, top_k=3)
+        top_match = predictions[0]
+        confidence = round(top_match["score"] * 100, 2)
 
-        if paddy_classifier:
-            rice_preds = paddy_classifier(processed_image, top_k=3)
-            top_rice = rice_preds[0]
-            rice_score = round(top_rice["score"] * 100, 2)
-        else:
-            rice_score = 0
-            rice_preds = []
+        def parse_label(label: str):
+            clean = label.replace("___", " - ").replace("_", " ")
+            if " - " in clean:
+                parts = clean.split(" - ")
+                crop_raw = parts[0].strip().replace("Pepper, bell", "Chilli / Pepper").title()
+                disease_raw = parts[1].strip().title()
+                return crop_raw, disease_raw
+            return "Plant / Crop", clean.strip().title()
 
-        if rice_score > hort_score and rice_score >= 35.0:
-            raw_key = top_rice["label"].lower().replace(" ", "_")
-            disease_name = RICE_LABELS_MAP.get(raw_key, top_rice["label"].replace("_", " ").title())
-            return {
-                "success": True,
-                "crop": "Paddy / Rice (వరి)",
-                "disease_detected": disease_name,
-                "confidence_score": f"{rice_score}%",
-                "certainty_level": "HIGH" if rice_score >= 75.0 else "MODERATE",
-                "is_ambiguous": (rice_score - round(rice_preds[1]["score"] * 100, 2)) < 12.0 if len(rice_preds) > 1 else False,
-                "top_possibilities": [
-                    {
-                        "crop": "Paddy / Rice",
-                        "disease": RICE_LABELS_MAP.get(p["label"].lower().replace(" ", "_"), p["label"]),
-                        "confidence": f"{round(p["score"] * 100, 2)}%"
-                    }
-                    for p in rice_preds[:3]
-                ]
-            }
+        crop, disease = parse_label(top_match["label"])
 
-        if hort_score < 30.0:
+        # Guardrail: Catch low confidence / unsupported crops
+        if confidence < CONFIDENCE_THRESHOLD_MIN:
             return {
                 "success": False,
-                "status": "UNRELIABLE_SAMPLE",
-                "message": "The leaf image was not recognized with sufficient confidence.",
-                "action_required": "Please provide a clearer, closer photo of the infected leaf in natural lighting."
+                "status": "UNRECOGNIZED_OR_LOW_CONFIDENCE",
+                "top_guess": f"{crop} ({disease})",
+                "confidence_score": str(confidence) + "%",
+                "message": "The crop leaf could not be identified with certainty. This usually happens if the leaf is Paddy/Rice, Wheat, or the photo is blurry.",
+                "guidance": "Supported crops in this model: Tomato, Potato, Corn, Pepper/Chilli, Apple, Grape, Strawberry."
             }
 
-        def clean_label(label: str):
-            if "___" in label:
-                c, d = label.split("___")
-                return c.replace("_", " ").replace("Pepper, bell", "Chilli / Capsicum").capitalize(), d.replace("_", " ").capitalize()
-            return "Plant", label.replace("_", " ").capitalize()
-
-        crop_1, dis_1 = clean_label(top_hort["label"])
         return {
             "success": True,
-            "crop": crop_1,
-            "disease_detected": dis_1,
-            "confidence_score": f"{hort_score}%",
-            "certainty_level": "HIGH" if hort_score >= 75.0 else "MODERATE",
-            "is_ambiguous": False,
+            "crop": crop,
+            "disease_detected": disease,
+            "confidence_score": str(confidence) + "%",
+            "certainty_level": "HIGH" if confidence >= CONFIDENCE_THRESHOLD_HIGH else "MODERATE",
             "top_possibilities": [
                 {
-                    "crop": clean_label(p["label"])[0],
-                    "disease": clean_label(p["label"])[1],
-                    "confidence": f"{round(p["score"] * 100, 2)}%"
+                    "crop": parse_label(p["label"])[0],
+                    "disease": parse_label(p["label"])[1],
+                    "confidence": str(round(p["score"] * 100, 2)) + "%"
                 }
-                for p in hort_preds[:3]
+                for p in predictions
             ]
         }
     except Exception as error:
-        raise HTTPException(status_code=500, detail=f"Diagnostic error: {str(error)}")
+        raise HTTPException(status_code=500, detail=f"Diagnosis error: {str(error)}")
